@@ -1,0 +1,233 @@
+import json
+import re
+from typing import Any, Callable, List, Tuple, Optional, Union
+
+# Variables to record leftover tokens and callback for extra tokens
+def _default_on_extra_token(text: str, data: Any, reminding: str) -> None:
+    print(f"Parsed JSON with extra tokens. Text: {text!r}, Data: {data!r}, Reminding: {reminding!r}")
+
+# Publicly visible globals
+last_parse_reminding: Optional[str] = None
+on_extra_token: Callable[[str, Any, str], None] = _default_on_extra_token
+
+class ParseError(Exception):
+    """Custom exception for parsing failures"""
+    pass
+
+# Core parse function
+def parse(s: Optional[str]) -> Any:
+    """
+    Parse a (possibly incomplete) JSON-like string as much as possible.
+    Returns the parsed data, and sets `last_parse_reminding` to any leftover text.
+    """
+    global last_parse_reminding
+    if s is None:
+        last_parse_reminding = None
+        return None
+    if s == '':
+        last_parse_reminding = ''
+        return ''
+
+    # Remove incomplete escaped backslashes at end
+    s = _trim_incomplete_escapes(s)
+
+    try:
+        # Try full JSON parse first
+        result = json.loads(s)
+        last_parse_reminding = ''
+        return result
+    except Exception as e:
+        # Fallback to custom parser
+        data, reminding = _parse_any(s, e, initial=True)
+        last_parse_reminding = reminding
+        # Notify on extra token if any
+        if on_extra_token and reminding.strip():
+            trimmed = reminding.rstrip()
+            last_parse_reminding = trimmed
+            if trimmed:
+                on_extra_token(s, data, trimmed)
+        return data
+
+
+# Remove trailing incomplete escape (odd number of backslashes)
+def _trim_incomplete_escapes(s: str) -> str:
+    match = re.search(r"(\\+)$", s)
+    if match:
+        tail = match.group(1)
+        if len(tail) % 2 == 1:
+            # drop one backslash
+            return s[:-1]
+    return s
+
+# Skip whitespace
+def _skip_space(s: str) -> str:
+    return s.lstrip()
+
+# Type alias for parser functions
+Parser = Callable[[str, Exception], Tuple[Any, str]]
+
+# Mapping first character to parser
+PARSERS: dict[str, Parser] = {}
+
+# Entry for whitespace
+for c in [' ', '\r', '\n', '\t']:
+    PARSERS[c] = lambda s, e: (_skip_space(s), None)  # placeholder, will override below
+
+# Actual whitespace parser
+def _parse_space(s: str, e: Exception) -> Tuple[Any, str]:
+    s2 = _skip_space(s)
+    return _parse_any(s2, e)
+
+for c in [' ', '\r', '\n', '\t']:
+    PARSERS[c] = _parse_space
+
+# Number characters
+for c in '0123456789-.':
+    PARSERS[c] = lambda s, e: _parse_number(s)
+
+# Basic token parsers
+PARSERS['['] = lambda s, e: _parse_array(s, e)
+PARSERS['{'] = lambda s, e: _parse_object(s, e)
+PARSERS['"'] = lambda s, e: _parse_string(s)
+PARSERS["'"] = lambda s, e: _parse_single_quote_string(s)
+PARSERS['t'] = lambda s, e: _parse_token(s, 'true', True, e)
+PARSERS['f'] = lambda s, e: _parse_token(s, 'false', False, e)
+PARSERS['n'] = lambda s, e: _parse_token(s, 'null', None, e)
+
+# Generic parse entry
+def _parse_any(s: str, e: Exception, initial: bool=False) -> Tuple[Any, str]:
+    """
+    Choose appropriate parser based on first non-space character
+    """
+    if not initial:
+        s = _skip_space(s)
+    if not s:
+        raise ParseError("Empty input during parse_any")
+    parser = PARSERS.get(s[0]) or _parse_string_without_quote
+    return parser(s, e)
+
+# Array parser
+def _parse_array(s: str, e: Exception) -> Tuple[List[Any], str]:
+    s = s[1:]  # skip '['
+    acc: List[Any] = []
+    s = _skip_space(s)
+    while s:
+        if s[0] == ']':
+            return acc, s[1:]
+        val, rest = _parse_any(s, e)
+        acc.append(val)
+        s = _skip_space(rest)
+        if s and s[0] == ',':
+            s = _skip_space(s[1:])
+    return acc, ''
+
+# Object parser
+def _parse_object(s: str, e: Exception) -> Tuple[dict, str]:
+    s = s[1:]  # skip '{'
+    obj: dict = {}
+    s = _skip_space(s)
+    while s:
+        if s[0] == '}':
+            return obj, s[1:]
+        # Parse key (string casual)
+        key, rest = _parse_string_casual(s, e)
+        s = _skip_space(rest)
+        if not s or s[0] != ':':
+            obj[key] = None
+            return obj, s
+        s = _skip_space(s[1:])  # skip ':'
+        if not s:
+            obj[key] = None
+            return obj, ''
+        val, rest = _parse_any(s, e)
+        obj[key] = val
+        s = _skip_space(rest)
+        if s and s[0] == ',':
+            s = _skip_space(s[1:])
+    return obj, ''
+
+# String parser for double-quoted strings
+def _parse_string(s: str) -> Tuple[str, str]:
+    i = 1
+    while i < len(s):
+        c = s[i]
+        if c == '\\':
+            i += 2
+            continue
+        if c == '"':
+            raw = s[:i+1]
+            fixed = _fix_escaped_characters(raw)
+            val = json.loads(fixed)
+            return val, s[i+1:]
+        i += 1
+    # No closing quote found -> assume end
+    fixed = _fix_escaped_characters(s) + '"'
+    val = json.loads(fixed)
+    return val, ''
+
+# String parser for single-quoted strings
+def _parse_single_quote_string(s: str) -> Tuple[str, str]:
+    i = 1
+    while i < len(s):
+        c = s[i]
+        if c == '\\':
+            i += 2
+            continue
+        if c == "'":
+            raw = s[:i+1]
+            fixed = _fix_escaped_characters(raw)
+            # Convert to JSON double-quoted string
+            val = json.loads('"' + fixed[1:-1] + '"')
+            return val, s[i+1:]
+        i += 1
+    # No closing quote -> assume end
+    fixed = _fix_escaped_characters(s[1:])
+    val = json.loads('"' + fixed + '"')
+    return val, ''
+
+# Unquoted string parser (until delimiters)
+def _parse_string_without_quote(s: str, e: Exception) -> Tuple[str, str]:
+    # default delimiters: whitespace, ',', ']', '}'
+    delim = [' ', '\r', '\n', '\t', ',', ']', '}']
+    idxs = [s.find(d) for d in delim]
+    idxs = [i for i in idxs if i >= 0]
+    end = min(idxs) if idxs else len(s)
+    token = s[:end].strip()
+    return token, s[end:]
+
+# Number parser
+def _parse_number(s: str) -> Tuple[Union[int, float, str], str]:
+    match = re.match(r"^-?[0-9]+(?:\.[0-9]*)?(?:[eE][+-]?[0-9]+)?", s)
+    if match:
+        num_str = match.group(0)
+        rest = s[len(num_str):]
+        try:
+            if '.' in num_str or 'e' in num_str or 'E' in num_str:
+                num = float(num_str)
+            else:
+                num = int(num_str)
+        except ValueError:
+            return num_str, rest
+        return num, rest
+    # No number -> fallback
+    return '', s
+
+# True/False/Null token parser
+def _parse_token(s: str, token_str: str, token_val: Any, e: Exception) -> Tuple[Any, str]:
+    # Try longest matching prefix of token_str
+    for i in range(len(token_str), 0, -1):
+        if s.startswith(token_str[:i]):
+            return token_val, s[i:]
+    raise e
+
+# Casual string parser that handles quoted or unquoted keys
+def _parse_string_casual(s: str, e: Exception) -> Tuple[str, str]:
+    if s.startswith('"'):
+        return _parse_string(s)
+    if s.startswith("'"):
+        return _parse_single_quote_string(s)
+    return _parse_string_without_quote(s, e)
+
+# Fix control characters before JSON loads
+def _fix_escaped_characters(s: str) -> str:
+    return s.replace('\n', '\\n').replace('\t', '\\t').replace('\r', '\\r')
